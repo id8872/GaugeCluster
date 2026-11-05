@@ -1,27 +1,56 @@
 // ============================================================================
-// GaugeCluster.cs - a small instrument cluster for the chart's price panel:
+// GaugeCluster.cs v1.1 - a small instrument cluster for the chart's price panel:
 //   * ADX(14)  as a semicircular SPEEDOMETER (zones 0-20 grey, 20-25 amber,
 //     25-50 green, 50-80 red; scale 0-80) - trend strength is a "how fast
-//     are we going" number, so a speedo is its natural shape.
-//   * RSI(7,3) as a horizontal SLIDER bar (same parameters QuickCover
+//     are we going" number, so a speedo is its natural shape. v1.1: two
+//     small ticks mark CoverRunnerScalper's engine thresholds - 28
+//     (MomentumAdxMin: momentum mode on) and 32 (MaxAdxForSweep: sweep
+//     engine off) - and the regime label states which CRS engines are
+//     live instead of a generic "STRONG".
+//   * RSI(7,3) as a horizontal SLIDER bar (same parameters CoverRunnerScalper
 //     uses, so the gauge and the HUD always agree) - RSI's meaning
 //     lives at BOTH ends (oversold < 30, overbought > 70, neutral
 //     between), so a two-ended bar reads honestly where a speedo
-//     would not.
-//   * ATR(14)  as a vertical THERMOMETER in ticks, scale 0-60, with the
-//     ES/MES strategy profile's 44t entry ceiling drawn as a line across
-//     the column; the mercury turns red near the top and the gauge prints
-//     LOCKED when ATR is over the ceiling (entries vetoed).
+//     would not. The 30/70 hot zones coincide with CRS's chase guards
+//     (TrendRsiMinForShort / TrendRsiMaxForLong).
+//   * ATR(14)  as a vertical THERMOMETER in ticks, scale 0-60, with BOTH of
+//     the ES/MES profile's CRS limits drawn across the column: the 44t
+//     entry ceiling (profMaxAtrTicks) and the 5t floor (profMinAtrTicks -
+//     a too-quiet tape vetoes entries just as hard as a too-fast one).
+//     The mercury turns red near the top and grey below the floor; the
+//     gauge prints LOCKED HIGH above the ceiling and LOCKED LOW under
+//     the floor (entries vetoed either way).
 //
-//   * LEVELS from the daily levels XML (the same file QuickCoverScalper
+//   * LEVELS from the daily levels XML (the same file CoverRunnerScalper
 //     reads - set the path once below; it reloads automatically when the
 //     file is regenerated): drawn as labelled lines across the panel,
 //     plus a nearest-above / nearest-below readout with tick distances
-//     under the RSI slider.
+//     under the RSI slider. NOTE: CRS additionally session-tags the file
+//     and rejects future-dated files; this gauge only checks write-time
+//     freshness, so its lines are a display aid, not the strategy's
+//     guard of record.
 //
 // The cluster auto-scales with the chart panel (designed on a
 // ~1900x950 panel, scale clamped 0.40-1.25x) and has a manual Size %
 // multiplier in the Position settings.
+//
+// v1.1 changes (Nov 5, 2026):
+//   1. Text rendering: one cached DirectWrite factory plus a TextFormat
+//      cache per (render scale, font size), instead of a new factory and
+//      format for every text call (~15-25 allocations per render pass
+//      before). All of it is disposed in State.Terminated.
+//   2. ATR LOW lock added: CRS vetoes entries below profMinAtrTicks
+//      (5t on the ES/MES profile) as well as above the ceiling - the
+//      thermometer now shows both locks.
+//   3. ADX 28/32 engine ticks plus engine-accurate regime labels.
+//   4. Comments and defaults renamed from the retired QuickCoverScalper
+//      fork to CoverRunnerScalper (v2.0.14); the default levels path is
+//      CRS's own default. CRS resolves Levels_<instrument>.xml and then
+//      Levels_<family>.xml ahead of the plain name - if you keep
+//      instrument-specific files, point this gauge at whatever the
+//      [CRS] LEVELS line in the Output window says it loaded.
+//   5. Readout glyphs switched to plain ASCII (^ v -) so a chat/editor
+//      paste cannot mangle them the way special characters have before.
 //
 // Display-only indicator (built for Jason, Nov 5, 2026). No plots, no
 // trading interaction. Values update on bar close. Replaces ADXSpeedo.cs.
@@ -29,7 +58,9 @@
 // Install: save into C:\NinjaTrader 8\bin\Custom\Indicators\Jason\,
 // press F5 in the NinjaScript Editor, then add "GaugeCluster" from the
 // chart's Indicators dialog. (If you saved ADXSpeedo.cs earlier, delete
-// it - this file supersedes it.)
+// it - this file supersedes it.) An indicator-only compile is safe while
+// CoverRunnerScalper is running, per established practice; the strategy
+// itself is untouched.
 // ============================================================================
 
 using System;
@@ -63,7 +94,8 @@ namespace NinjaTrader.NinjaScript.Indicators
     {
         private const double AdxScaleMax = 80.0;
         private const double AtrScaleMax = 60.0;
-        private const double AtrCeilingTicks = 44.0; // ES/MES profile ceiling in QuickCoverScalper
+        private const double AtrCeilingTicks = 44.0; // CRS ES/MES profile: profMaxAtrTicks (entry veto above)
+        private const double AtrFloorTicks = 5.0;    // v1.1: CRS ES/MES profile: profMinAtrTicks (entry veto below)
 
         private ADX adxSeries;
         private RSI rsiSeries;
@@ -76,6 +108,16 @@ namespace NinjaTrader.NinjaScript.Indicators
         private bool hasAtr;
 
         private float renderScale = 1f;
+
+        // v1.1: cached DirectWrite text resources. Before, every
+        // DrawCenteredText call created AND disposed a new DirectWrite
+        // factory + TextFormat - roughly 15-25 per render pass, on every
+        // chart refresh. The factory now lives for the indicator's
+        // lifetime; formats are keyed by scaled font size and thrown
+        // away when the render scale changes (panel resize / Size % edit).
+        private SharpDX.DirectWrite.Factory writeFactory;
+        private Dictionary<float, SharpDX.DirectWrite.TextFormat> formatCache = new Dictionary<float, SharpDX.DirectWrite.TextFormat>();
+        private float formatCacheScale = -1f;
 
         private List<double> fileLevels = new List<double>();
         private DateTime loadedStamp = DateTime.MinValue;
@@ -94,7 +136,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 DisplayInDataBox = false;
                 PaintPriceMarkers = false;
                 IsSuspendedWhileInactive = true;
-                LevelsFilePath = @"G:\My Drive\ES_price_levels.xml";
+                LevelsFilePath = @"C:\NinjaTrader 8\Levels_ES.xml";  // v1.1: CRS's own default path
                 Position = GaugeClusterPosition.MiddleLeft;
                 OffsetX = 16;
                 OffsetY = 16;
@@ -105,6 +147,18 @@ namespace NinjaTrader.NinjaScript.Indicators
                 adxSeries = ADX(14);
                 rsiSeries = RSI(7, 3);
                 atrSeries = ATR(14);
+            }
+            else if (State == State.Terminated)
+            {
+                // v1.1: release the cached DirectWrite resources.
+                foreach (KeyValuePair<float, SharpDX.DirectWrite.TextFormat> kv in formatCache)
+                    kv.Value.Dispose();
+                formatCache.Clear();
+                if (writeFactory != null)
+                {
+                    writeFactory.Dispose();
+                    writeFactory = null;
+                }
             }
         }
 
@@ -118,10 +172,12 @@ namespace NinjaTrader.NinjaScript.Indicators
             MaybeReloadLevels();
         }
 
-        // Mirrors QuickCoverScalper's level loading: bare prices from the
+        // Mirrors CoverRunnerScalper's level loading: bare prices from the
         // "value" attribute of each <Level> element, stale files (older
         // than yesterday) ignored, reloads when the file's write time
         // changes so the morning regeneration flows through on its own.
+        // (CRS additionally session-tags the file and rejects future-dated
+        // files; this gauge keeps the simpler write-time freshness rule.)
         private void MaybeReloadLevels()
         {
             try
@@ -184,17 +240,22 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
+        // v1.1: text is drawn with a cached TextFormat keyed by the scaled
+        // font size (the alignment settings are constant across calls, so
+        // they are set once at creation instead of per call).
         private void DrawCenteredText(string text, float centerX, float topY, float width, float fontSize, SolidColorBrush brush)
         {
             fontSize = Math.Max(7f, fontSize * renderScale);
-            using (SharpDX.DirectWrite.Factory factory = new SharpDX.DirectWrite.Factory())
-            using (SharpDX.DirectWrite.TextFormat format = new SharpDX.DirectWrite.TextFormat(factory, "Arial", fontSize))
+            SharpDX.DirectWrite.TextFormat format;
+            if (!formatCache.TryGetValue(fontSize, out format))
             {
+                format = new SharpDX.DirectWrite.TextFormat(writeFactory, "Arial", fontSize);
                 format.TextAlignment = SharpDX.DirectWrite.TextAlignment.Center;
                 format.ParagraphAlignment = SharpDX.DirectWrite.ParagraphAlignment.Near;
-                RectangleF rect = new RectangleF(centerX - width / 2f, topY, width, fontSize + 8f);
-                RenderTarget.DrawText(text, format, rect, brush);
+                formatCache[fontSize] = format;
             }
+            RectangleF rect = new RectangleF(centerX - width / 2f, topY, width, fontSize + 8f);
+            RenderTarget.DrawText(text, format, rect, brush);
         }
 
         // ---- render -----------------------------------------------------------
@@ -212,6 +273,18 @@ namespace NinjaTrader.NinjaScript.Indicators
             s = Math.Max(0.40f, Math.Min(1.25f, s));
             s = s * SizePercent / 100f;
             renderScale = s;
+
+            // v1.1: drop cached text formats when the render scale changes,
+            // and lazily (re)create the single DirectWrite factory.
+            if (formatCacheScale != renderScale)
+            {
+                foreach (KeyValuePair<float, SharpDX.DirectWrite.TextFormat> kv in formatCache)
+                    kv.Value.Dispose();
+                formatCache.Clear();
+                formatCacheScale = renderScale;
+            }
+            if (writeFactory == null)
+                writeFactory = new SharpDX.DirectWrite.Factory();
 
             // Cluster origin from the anchor + offsets; the internal layout
             // below is drawn relative to (rightEdge, topY), scaled by s.
@@ -291,7 +364,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 {
                     double frac = Math.Max(0.0, Math.Min(1.0, atrTicks / AtrScaleMax));
                     float fillH = (float)(atrH * frac);
-                    SolidColorBrush fillBrush = atrTicks < 22.0 ? greenBrush : (atrTicks < 38.0 ? amberBrush : redBrush);
+                    // v1.1: grey mercury below the 5t floor - a dead tape
+                    // vetoes entries in CRS just like an overheated one.
+                    SolidColorBrush fillBrush = atrTicks < AtrFloorTicks
+                        ? dimBrush
+                        : (atrTicks < 22.0 ? greenBrush : (atrTicks < 38.0 ? amberBrush : redBrush));
                     if (fillH > 0f)
                         RenderTarget.FillRectangle(new RectangleF(atrX + 1f, atrBottom - fillH, atrW - 2f, fillH), fillBrush);
                 }
@@ -301,11 +378,19 @@ namespace NinjaTrader.NinjaScript.Indicators
                 RenderTarget.DrawLine(new Vector2(atrX - 4f, ceilY), new Vector2(atrX + atrW + 4f, ceilY), needleBrush, Math.Max(1f, 1.5f * s));
                 DrawCenteredText("44", atrCx, ceilY - 16f * s, 40f, 9f, dimBrush);
 
+                // v1.1: the 5t floor line (CRS profMinAtrTicks) + label.
+                float floorY = atrBottom - (float)(atrH * (AtrFloorTicks / AtrScaleMax));
+                RenderTarget.DrawLine(new Vector2(atrX - 4f, floorY), new Vector2(atrX + atrW + 4f, floorY), needleBrush, Math.Max(1f, 1.5f * s));
+                DrawCenteredText("5", atrCx, floorY + 3f * s, 40f, 9f, dimBrush);
+
                 if (hasAtr)
                 {
                     DrawCenteredText(atrTicks.ToString("F0") + "t", atrCx, atrBottom + 4f * s, 48f, 12f, textBrush);
+                    // v1.1: both sides of the entry veto are now shown.
                     if (atrTicks > AtrCeilingTicks)
-                        DrawCenteredText("LOCKED", atrCx, atrBottom + 20f * s, 56f, 10f, redBrush);
+                        DrawCenteredText("LOCKED HIGH", atrCx, atrBottom + 20f * s, 64f, 10f, redBrush);
+                    else if (atrTicks < AtrFloorTicks)
+                        DrawCenteredText("LOCKED LOW", atrCx, atrBottom + 20f * s, 64f, 10f, redBrush);
                 }
 
                 // ---------- ADX speedometer (left of the thermometer) ----------
@@ -333,20 +418,38 @@ namespace NinjaTrader.NinjaScript.Indicators
                         DrawCenteredText(ticks[i].ToString("F0"), tp.X, tp.Y - 7f, 34f, 10f, dimBrush);
                     }
 
+                    // v1.1: CRS engine thresholds as small radial ticks just
+                    // outside the arc: 28 = momentum mode on (MomentumAdxMin,
+                    // green), 32 = sweep engine off (MaxAdxForSweep, red).
+                    // The 0/20/40/60/80 labels sit further out, so no collision.
+                    double[] engineMarks = new double[] { 28.0, 32.0 };
+                    for (int i = 0; i < engineMarks.Length; i++)
+                    {
+                        Vector2 tickA = DialPoint(cx, cy, radius + 3f, engineMarks[i] / AdxScaleMax);
+                        Vector2 tickB = DialPoint(cx, cy, radius + 9f, engineMarks[i] / AdxScaleMax);
+                        SolidColorBrush markBrush = engineMarks[i] < 30.0 ? greenBrush : redBrush;
+                        RenderTarget.DrawLine(tickA, tickB, markBrush, Math.Max(1f, 2f * s));
+                        Vector2 mp = DialPoint(cx, cy, radius + 13f, engineMarks[i] / AdxScaleMax);
+                        DrawCenteredText(engineMarks[i].ToString("F0"), mp.X, mp.Y - 7f, 30f, 9f, markBrush);
+                    }
+
                     Vector2 tip = DialPoint(cx, cy, radius - 13f * s, v / AdxScaleMax);
                     RenderTarget.DrawLine(new Vector2(cx, cy), tip, needleBrush, Math.Max(1.2f, 3f * s));
                     float hub = Math.Max(2.5f, 5f * s);
                     RenderTarget.FillEllipse(new Ellipse(new Vector2(cx, cy), hub, hub), needleBrush);
 
+                    // v1.1: the regime label now states which CRS engines are
+                    // live at this ADX instead of a generic "STRONG".
                     string regime;
-                    if (adxValue < 20.0) regime = "NO TREND";
-                    else if (adxValue < 25.0) regime = "DEVELOPING";
-                    else if (adxValue < 50.0) regime = "STRONG";
+                    if (adxValue < 20.0) regime = "SWEEP ONLY";          // trend engine off (MinAdxForTrend)
+                    else if (adxValue < 28.0) regime = "TREND";          // trend engine, pullback mode only
+                    else if (adxValue < 32.0) regime = "TREND+MOM";      // momentum mode on (MomentumAdxMin)
+                    else if (adxValue < 50.0) regime = "TREND (SWEEP OFF)";
                     else regime = "VERY STRONG";
 
                     DrawCenteredText("ADX", cx, cy - 34f * s, 90f, 11f, dimBrush);
                     DrawCenteredText(adxValue.ToString("F0"), cx, cy - 20f * s, 90f, 20f, textBrush);
-                    DrawCenteredText(regime, cx, cy + 8f * s, 130f, 11f, textBrush);
+                    DrawCenteredText(regime, cx, cy + 8f * s, 150f, 11f, textBrush);
                 }
 
                 // ---------- RSI slider (under the speedometer) ----------
@@ -398,12 +501,14 @@ namespace NinjaTrader.NinjaScript.Indicators
                         if (fileLevels[i] > lastPrice && (!hasAbove || fileLevels[i] < above)) { above = fileLevels[i]; hasAbove = true; }
                         if (fileLevels[i] < lastPrice && (!hasBelow || fileLevels[i] > below)) { below = fileLevels[i]; hasBelow = true; }
                     }
+                    // v1.1: plain-ASCII glyphs (^ v -) so a copy/paste
+                    // through chat or the editor cannot mangle them.
                     string line1 = hasAbove
-                        ? "▲ " + above.ToString("F2") + "  +" + Math.Round((above - lastPrice) / TickSize).ToString("F0") + "t"
-                        : "▲ —";
+                        ? "^ " + above.ToString("F2") + "  +" + Math.Round((above - lastPrice) / TickSize).ToString("F0") + "t"
+                        : "^ -";
                     string line2 = hasBelow
-                        ? "▼ " + below.ToString("F2") + "  -" + Math.Round((lastPrice - below) / TickSize).ToString("F0") + "t"
-                        : "▼ —";
+                        ? "v " + below.ToString("F2") + "  -" + Math.Round((lastPrice - below) / TickSize).ToString("F0") + "t"
+                        : "v -";
                     DrawCenteredText(line1, cx, lvlY, 180f, 11f, textBrush);
                     DrawCenteredText(line2, cx, lvlY + 16f * s, 180f, 11f, textBrush);
                 }
@@ -415,7 +520,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
 
         [NinjaScriptProperty]
-        [Display(Name = "Levels File Path", Description = "Full path to the daily levels XML - the same file QuickCoverScalper reads.", Order = 1, GroupName = "Levels")]
+        [Display(Name = "Levels File Path", Description = "Full path to the daily levels XML - the same file CoverRunnerScalper reads. Match what the [CRS] LEVELS line in the Output window says it loaded (CRS tries Levels_<instrument>.xml, then Levels_<family>.xml, before the plain name).", Order = 1, GroupName = "Levels")]
         public string LevelsFilePath { get; set; }
 
         [NinjaScriptProperty]
