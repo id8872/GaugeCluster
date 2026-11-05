@@ -6,7 +6,7 @@ It is display-only: it never trades, never places or modifies orders, and shares
 
 v1.0 by Muse Spark (Meta); v1.1 revisions by Vibe (Mistral AI).
 
-![GaugeCluster on an MES chart](gaugecluster.png)
+![The v1.1 gauge cluster](gaugecluster.png)
 
 ## Why three different shapes
 
