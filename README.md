@@ -77,6 +77,10 @@ Tweaks live at the top of the file: `AtrCeilingTicks` (44) and `AtrFloorTicks` (
 - ATR limits are constants: a chart running both MES and NQ panels needs separate copies with different constants if the LOCKED lines matter on both.
 - The thresholds are ES/MES-centric: everything renders on any instrument, but the marks mean what they say only for the ES/MES strategy profile.
 
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 ## Disclaimer
 
 A charting aid, published for education and discussion. It displays indicator values and file data; it is not a trading system and not financial advice.
