@@ -1,21 +1,30 @@
 // ============================================================================
-// GaugeCluster.cs v1.6 - An all-in-one HUD instrument cluster for NinjaTrader 8:
+// GaugeCluster.cs v1.9 - An all-in-one HUD instrument cluster for NinjaTrader 8:
 //   * ADX(14)  - Semicircular speedometer (0-80 scale; zones 0-20 grey,
 //     20-25 amber, 25-50 green, 50-80 red) with two customizable radial
-//     threshold ticks (default 28 and 32), dynamic regime labels, and
-//     high-contrast zone-matched needle/hub/readout tints.
+//     threshold ticks (default 28 and 32), dynamic regime labels with
+//     optional +DI/-DI directional arrow & tint, and high-contrast
+//     zone-matched needle/hub/readout tints.
+//   * DI Tug-of-War Bar (Optional, default ON) - Horizontal +DI vs -DI
+//     dominance split bar and numeric readout right beneath the ADX dial.
 //   * RSI(7,3) - Horizontal two-ended slider bar (oversold < 30 in cyan,
 //     neutral 30-70, overbought > 70 in coral-orange; periods configurable)
 //     with bright contrast marker and readout tints.
+//   * EMA Bias Badge (Optional, default OFF) - Compact BULL / BEAR readout
+//     comparing Close against a configurable EMA (default 21).
 //   * ATR(14)  - Vertical thermometer measured in ticks (0-60 scale) with
 //     customizable floor and ceiling threshold lines (default 5t and 44t),
 //     zone-matched mercury and high-contrast tick readout, and LOCKED LOW /
 //     LOCKED HIGH status alerts.
+//   * Optional Audio/Visual Alerts (v1.9, default OFF) - Threshold crossing
+//     alerts for ADX Momentum entry, +DI/-DI directional flips, ATR Lock
+//     state changes, and RSI extremes with a clickable mute/unmute bell icon.
 //
 // Features:
 //   * Auto-scales proportionally to chart panel size (clamped 0.40x-1.25x)
 //     plus a manual Size % multiplier (40% - 300%).
-//   * Rounded-corner opaque background card with adjustable opacity (0-100%).
+//   * Rounded-corner opaque background card with adjustable opacity (0-100%)
+//     that dynamically adjusts height based on active optional modules.
 //   * Drag-and-drop repositioning anywhere on the price panel; Offset X/Y
 //     update automatically relative to the selected corner/edge anchor.
 //   * Cached DirectWrite factory and TextFormats for zero-allocation text
@@ -58,14 +67,33 @@ namespace NinjaTrader.NinjaScript.Indicators
         private const double AtrScaleMax = 60.0;
 
         private ADX adxSeries;
+        private DM dmSeries;
         private RSI rsiSeries;
         private ATR atrSeries;
+        private EMA emaSeries;
+
         private double adxValue;
+        private double diPlusValue;
+        private double diMinusValue;
         private double rsiValue;
         private double atrTicks;
+        private double emaValue;
+        private double lastClose;
+
         private bool hasAdx;
+        private bool hasDm;
         private bool hasRsi;
         private bool hasAtr;
+        private bool hasEma;
+
+        // Previous-bar state tracking for rising-edge alert triggers.
+        private bool prevStateInitialized;
+        private bool prevAdxMomentum;
+        private int prevDiDirection;   // 1 = +DI > -DI, -1 = -DI > +DI, 0 = tie
+        private int prevAtrLockState;  // -1 = LOCKED LOW, 0 = TRADABLE, 1 = LOCKED HIGH
+        private int prevRsiZone;       // -1 = OVERSOLD, 0 = NEUTRAL, 1 = OVERBOUGHT
+        private DateTime lastAlertUtc = DateTime.MinValue;
+        private bool alertsMuted;
 
         private float renderScale = 1f;
 
@@ -74,8 +102,9 @@ namespace NinjaTrader.NinjaScript.Indicators
         private Dictionary<float, SharpDX.DirectWrite.TextFormat> formatCache = new Dictionary<float, SharpDX.DirectWrite.TextFormat>();
         private float formatCacheScale = -1f;
 
-        // Bounding box & drag-and-drop state.
+        // Bounding box, bell hit-box & drag-and-drop state.
         private RectangleF clusterBounds = RectangleF.Empty;
+        private RectangleF bellBounds = RectangleF.Empty;
         private bool isDragging;
         private System.Windows.Point dragStartMouse;
         private int dragStartOffsetX;
@@ -86,7 +115,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             if (State == State.SetDefaults)
             {
-                Description = "Compact HUD instrument cluster displaying an ADX speedometer, RSI slider, and ATR tick thermometer on the price panel.";
+                Description = "Compact HUD instrument cluster displaying an ADX speedometer, directional DI bar, RSI slider, optional EMA bias, ATR tick thermometer, and threshold alerts.";
                 Name = "GaugeCluster";
                 Calculate = Calculate.OnBarClose;
                 IsOverlay = true;
@@ -103,6 +132,21 @@ namespace NinjaTrader.NinjaScript.Indicators
                 AtrPeriod = 14;
                 AtrFloorTicks = 5.0;
                 AtrCeilingTicks = 44.0;
+                EmaPeriod = 21;
+
+                // Directional feature toggles
+                ShowAdxDirection = true;
+                ShowDiBar = true;
+                ShowEmaBias = false;
+
+                // Alert settings
+                EnableAlerts = false;
+                AlertOnAdxMomentum = true;
+                AlertOnDiCross = true;
+                AlertOnAtrLock = true;
+                AlertOnRsiExtreme = false;
+                AlertCooldownSeconds = 60;
+                AlertSoundFile = "Alert1.wav";
 
                 // Layout & appearance
                 Position = GaugeClusterPosition.MiddleLeft;
@@ -114,8 +158,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             else if (State == State.DataLoaded)
             {
                 adxSeries = ADX(AdxPeriod);
+                dmSeries = DM(AdxPeriod);
                 rsiSeries = RSI(RsiPeriod, RsiSmooth);
                 atrSeries = ATR(AtrPeriod);
+                emaSeries = EMA(EmaPeriod);
             }
             else if (State == State.Historical)
             {
@@ -136,7 +182,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
-        // ---- drag-and-drop mouse hooks --------------------------------------
+        // ---- drag-and-drop & bell click hooks -------------------------------
 
         private void HookMouseEvents()
         {
@@ -176,7 +222,19 @@ namespace NinjaTrader.NinjaScript.Indicators
                 return;
 
             System.Windows.Point pt = e.GetPosition(ChartControl);
-            if (clusterBounds.Contains((float)pt.X, (float)pt.Y))
+            float px = (float)pt.X;
+            float py = (float)pt.Y;
+
+            // Clicking the bell icon toggles mute without initiating a drag.
+            if (EnableAlerts && !bellBounds.IsEmpty && bellBounds.Contains(px, py))
+            {
+                alertsMuted = !alertsMuted;
+                ChartControl.InvalidateVisual();
+                e.Handled = true;
+                return;
+            }
+
+            if (clusterBounds.Contains(px, py))
             {
                 isDragging = true;
                 dragStartMouse = pt;
@@ -224,11 +282,112 @@ namespace NinjaTrader.NinjaScript.Indicators
             e.Handled = true;
         }
 
+        // ---- bar updates & alert evaluation ---------------------------------
+
         protected override void OnBarUpdate()
         {
             if (adxSeries != null) { adxValue = adxSeries[0]; hasAdx = true; }
+            if (dmSeries != null)
+            {
+                diPlusValue = dmSeries.DiPlus[0];
+                diMinusValue = dmSeries.DiMinus[0];
+                hasDm = true;
+            }
             if (rsiSeries != null) { rsiValue = rsiSeries[0]; hasRsi = true; }
             if (atrSeries != null && TickSize > 0) { atrTicks = atrSeries[0] / TickSize; hasAtr = true; }
+            if (emaSeries != null)
+            {
+                emaValue = emaSeries[0];
+                lastClose = Close[0];
+                hasEma = true;
+            }
+
+            if (!hasAdx || !hasDm || !hasRsi || !hasAtr)
+                return;
+
+            double momThresh = AdxLowThreshold > 0 ? AdxLowThreshold : 25.0;
+            bool curAdxMomentum = adxValue >= momThresh;
+            int curDiDir = diPlusValue > diMinusValue ? 1 : (diMinusValue > diPlusValue ? -1 : 0);
+
+            int curAtrLock = 0;
+            if (AtrFloorTicks > 0 && atrTicks < AtrFloorTicks) curAtrLock = -1;
+            else if (AtrCeilingTicks > 0 && atrTicks > AtrCeilingTicks) curAtrLock = 1;
+
+            int curRsiZone = 0;
+            if (rsiValue < 30.0) curRsiZone = -1;
+            else if (rsiValue > 70.0) curRsiZone = 1;
+
+            // Seed baseline states on historical bars so loading a chart doesn't burst alerts.
+            if (!prevStateInitialized || State == State.Historical)
+            {
+                prevAdxMomentum = curAdxMomentum;
+                prevDiDirection = curDiDir;
+                prevAtrLockState = curAtrLock;
+                prevRsiZone = curRsiZone;
+                prevStateInitialized = true;
+                return;
+            }
+
+            if (EnableAlerts && !alertsMuted)
+            {
+                List<string> triggers = new List<string>();
+
+                // 1. ADX crossed into Momentum threshold
+                if (AlertOnAdxMomentum && curAdxMomentum && !prevAdxMomentum)
+                {
+                    string dirTag = curDiDir > 0 ? "BULL (+DI)" : (curDiDir < 0 ? "BEAR (-DI)" : "NEUTRAL");
+                    triggers.Add("ADX Momentum (" + adxValue.ToString("F0") + " " + dirTag + ")");
+                }
+
+                // 2. +DI / -DI directional flip while market is trending (ADX >= 20)
+                if (AlertOnDiCross && curDiDir != 0 && curDiDir != prevDiDirection && adxValue >= 20.0)
+                {
+                    string crossMsg = curDiDir > 0
+                        ? "DI Bullish Cross (+DI " + diPlusValue.ToString("F0") + " > -DI " + diMinusValue.ToString("F0") + ")"
+                        : "DI Bearish Cross (-DI " + diMinusValue.ToString("F0") + " > +DI " + diPlusValue.ToString("F0") + ")";
+                    triggers.Add(crossMsg);
+                }
+
+                // 3. ATR Lock state transition
+                if (AlertOnAtrLock && curAtrLock != prevAtrLockState)
+                {
+                    if (curAtrLock == -1)
+                        triggers.Add("ATR LOCKED LOW (" + atrTicks.ToString("F0") + "t < " + AtrFloorTicks.ToString("F0") + "t)");
+                    else if (curAtrLock == 1)
+                        triggers.Add("ATR LOCKED HIGH (" + atrTicks.ToString("F0") + "t > " + AtrCeilingTicks.ToString("F0") + "t)");
+                    else
+                        triggers.Add("ATR UNLOCKED (" + atrTicks.ToString("F0") + "t tradable)");
+                }
+
+                // 4. RSI entered Oversold (< 30) or Overbought (> 70)
+                if (AlertOnRsiExtreme && curRsiZone != 0 && curRsiZone != prevRsiZone)
+                {
+                    triggers.Add(curRsiZone < 0
+                        ? "RSI OVERSOLD (" + rsiValue.ToString("F0") + ")"
+                        : "RSI OVERBOUGHT (" + rsiValue.ToString("F0") + ")");
+                }
+
+                if (triggers.Count > 0)
+                {
+                    DateTime nowUtc = DateTime.UtcNow;
+                    if ((nowUtc - lastAlertUtc).TotalSeconds >= AlertCooldownSeconds)
+                    {
+                        lastAlertUtc = nowUtc;
+                        string instName = Instrument != null ? Instrument.MasterInstrument.Name : "Chart";
+                        string alertText = "GaugeCluster [" + instName + "]: " + string.Join(" | ", triggers);
+                        string sound = string.IsNullOrWhiteSpace(AlertSoundFile) ? "Alert1.wav" : AlertSoundFile.Trim();
+
+                        Alert("GaugeClusterAlert_" + CurrentBar, Priority.Medium, alertText,
+                            NinjaTrader.Core.Globals.InstallDir + @"\sounds\" + sound,
+                            AlertCooldownSeconds, System.Windows.Media.Brushes.Transparent, System.Windows.Media.Brushes.Transparent);
+                    }
+                }
+            }
+
+            prevAdxMomentum = curAdxMomentum;
+            prevDiDirection = curDiDir;
+            prevAtrLockState = curAtrLock;
+            prevRsiZone = curRsiZone;
         }
 
         // ---- shared helpers -------------------------------------------------
@@ -256,16 +415,65 @@ namespace NinjaTrader.NinjaScript.Indicators
         private void DrawCenteredText(string text, float centerX, float topY, float width, float fontSize, SolidColorBrush brush)
         {
             fontSize = Math.Max(7f, fontSize * renderScale);
+            float scaledW = Math.Max(width, width * renderScale);
             SharpDX.DirectWrite.TextFormat format;
             if (!formatCache.TryGetValue(fontSize, out format))
             {
                 format = new SharpDX.DirectWrite.TextFormat(writeFactory, "Arial", fontSize);
                 format.TextAlignment = SharpDX.DirectWrite.TextAlignment.Center;
                 format.ParagraphAlignment = SharpDX.DirectWrite.ParagraphAlignment.Near;
+                format.WordWrapping = SharpDX.DirectWrite.WordWrapping.NoWrap;
                 formatCache[fontSize] = format;
             }
-            RectangleF rect = new RectangleF(centerX - width / 2f, topY, width, fontSize + 8f);
+            RectangleF rect = new RectangleF(centerX - scaledW / 2f, topY, scaledW, fontSize + 8f);
             RenderTarget.DrawText(text, format, rect, brush);
+        }
+
+        private void DrawBellIcon(float centerX, float topY, float s, bool muted, bool recentFlash, SolidColorBrush activeBrush, SolidColorBrush flashBrush, SolidColorBrush mutedBrush)
+        {
+            SolidColorBrush brush = muted ? mutedBrush : (recentFlash ? flashBrush : activeBrush);
+            float stroke = Math.Max(1.1f, 1.4f * s);
+
+            // Bell dome & flared skirt
+            float domeR = 4.2f * s;
+            float domeCy = topY + 5.2f * s;
+            float skirtY = topY + 10.5f * s;
+            float skirtHalfW = 6.2f * s;
+
+            // Upper dome arc (left to right)
+            int segs = 10;
+            Vector2 prev = new Vector2(centerX - domeR, domeCy);
+            for (int i = 1; i <= segs; i++)
+            {
+                double a = Math.PI * (1.0 - (double)i / segs);
+                Vector2 p = new Vector2(centerX + (float)(domeR * Math.Cos(a)), domeCy - (float)(domeR * Math.Sin(a)));
+                RenderTarget.DrawLine(prev, p, brush, stroke);
+                prev = p;
+            }
+
+            // Sides flaring out to skirt + base rim
+            Vector2 leftDome = new Vector2(centerX - domeR, domeCy);
+            Vector2 rightDome = new Vector2(centerX + domeR, domeCy);
+            Vector2 leftSkirt = new Vector2(centerX - skirtHalfW, skirtY);
+            Vector2 rightSkirt = new Vector2(centerX + skirtHalfW, skirtY);
+
+            RenderTarget.DrawLine(leftDome, leftSkirt, brush, stroke);
+            RenderTarget.DrawLine(rightDome, rightSkirt, brush, stroke);
+            RenderTarget.DrawLine(leftSkirt, rightSkirt, brush, stroke);
+
+            // Top loop & bottom clapper
+            RenderTarget.DrawLine(new Vector2(centerX, topY + 0.2f * s), new Vector2(centerX, domeCy - domeR), brush, stroke);
+            float clapperR = Math.Max(1.2f, 1.6f * s);
+            RenderTarget.FillEllipse(new Ellipse(new Vector2(centerX, skirtY + 2.0f * s), clapperR, clapperR), brush);
+
+            // Diagonal slash when muted
+            if (muted)
+            {
+                RenderTarget.DrawLine(
+                    new Vector2(centerX - 7.5f * s, topY + 13.5f * s),
+                    new Vector2(centerX + 7.5f * s, topY - 0.5f * s),
+                    mutedBrush, Math.Max(1.2f, 1.6f * s));
+            }
         }
 
         // ---- render -----------------------------------------------------------
@@ -293,12 +501,15 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (writeFactory == null)
                 writeFactory = new SharpDX.DirectWrite.Factory();
 
-            // Outer card dimensions (evenly padded around the drawn elements).
+            // Dynamic height expansion for optional directional rows.
+            float diExtraH = ShowDiBar ? (26f * s) : 0f;
+            float emaExtraH = ShowEmaBias ? (24f * s) : 0f;
+
             float padX = 16f * s;
             float padTop = 16f * s;
             float padBottom = 14f * s;
             float innerW = 208f * s;
-            float innerH = 194f * s;
+            float innerH = 194f * s + diExtraH + emaExtraH;
 
             float clusterW = innerW + padX * 2f;
             float clusterH = innerH + padTop + padBottom;
@@ -375,15 +586,29 @@ namespace NinjaTrader.NinjaScript.Indicators
                 RenderTarget.FillRoundedRectangle(roundedBg, bgBrush);
                 RenderTarget.DrawRoundedRectangle(roundedBg, bgBorderBrush, isDragging ? Math.Max(1.5f, 2f * s) : 1f);
 
-                // ---------- ATR thermometer (rightmost column) ----------
+                // ---------- Optional Alert Bell Icon (top-left of card) ----------
+                if (EnableAlerts)
+                {
+                    float bellW = 22f * s;
+                    float bellH = 22f * s;
+                    bellBounds = new RectangleF(ox + 8f * s, oy + 7f * s, bellW, bellH);
+                    bool recentFlash = (DateTime.UtcNow - lastAlertUtc).TotalSeconds < 4.0;
+                    DrawBellIcon(bellBounds.X + bellW / 2f, bellBounds.Y + 4f * s, s, alertsMuted, recentFlash, amberHiBrush, greenHiBrush, dimBrush);
+                }
+                else
+                {
+                    bellBounds = RectangleF.Empty;
+                }
+
+                // ---------- ATR thermometer (rightmost column, stretches with card height) ----------
                 float atrW = 18f * s;
                 float atrX = rightEdge - atrW;
                 float atrTop = topY + 16f * s;
-                float atrH = 168f * s;
+                float atrH = 168f * s + diExtraH + emaExtraH;
                 float atrBottom = atrTop + atrH;
                 float atrCx = atrX + atrW / 2f;
 
-                DrawCenteredText("ATR", atrCx, topY - 4f * s, 44f, 11f, dimBrush);
+                DrawCenteredText("ATR", atrCx, topY - 4f * s, 52f, 11f, dimBrush);
                 RenderTarget.FillRectangle(new RectangleF(atrX, atrTop, atrW, atrH), trackBrush);
                 RenderTarget.DrawRectangle(new RectangleF(atrX, atrTop, atrW, atrH), rimBrush, 1f);
 
@@ -423,7 +648,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 {
                     float ceilY = atrBottom - (float)(atrH * (AtrCeilingTicks / AtrScaleMax));
                     RenderTarget.DrawLine(new Vector2(atrX - 4f, ceilY), new Vector2(atrX + atrW + 4f, ceilY), lineWhiteBrush, Math.Max(1f, 1.5f * s));
-                    DrawCenteredText(AtrCeilingTicks.ToString("F0"), atrCx, ceilY - 16f * s, 40f, 9f, dimBrush);
+                    DrawCenteredText(AtrCeilingTicks.ToString("F0"), atrCx, ceilY - 16f * s, 44f, 9f, dimBrush);
                 }
 
                 // Lower ATR floor line + label.
@@ -431,16 +656,16 @@ namespace NinjaTrader.NinjaScript.Indicators
                 {
                     float floorY = atrBottom - (float)(atrH * (AtrFloorTicks / AtrScaleMax));
                     RenderTarget.DrawLine(new Vector2(atrX - 4f, floorY), new Vector2(atrX + atrW + 4f, floorY), lineWhiteBrush, Math.Max(1f, 1.5f * s));
-                    DrawCenteredText(AtrFloorTicks.ToString("F0"), atrCx, floorY + 3f * s, 40f, 9f, dimBrush);
+                    DrawCenteredText(AtrFloorTicks.ToString("F0"), atrCx, floorY + 3f * s, 44f, 9f, dimBrush);
                 }
 
                 if (hasAtr)
                 {
-                    DrawCenteredText(atrTicks.ToString("F0") + "t", atrCx, atrBottom + 4f * s, 48f, 12f, atrHiBrush);
+                    DrawCenteredText(atrTicks.ToString("F0") + "t", atrCx, atrBottom + 4f * s, 56f, 12f, atrHiBrush);
                     if (atrTicks > AtrCeilingTicks)
-                        DrawCenteredText("LOCKED HIGH", atrCx, atrBottom + 20f * s, 64f, 10f, redHiBrush);
+                        DrawCenteredText("LOCKED HIGH", atrCx, atrBottom + 20f * s, 84f, 10f, redHiBrush);
                     else if (atrTicks < AtrFloorTicks)
-                        DrawCenteredText("LOCKED LOW", atrCx, atrBottom + 20f * s, 64f, 10f, redHiBrush);
+                        DrawCenteredText("LOCKED LOW", atrCx, atrBottom + 20f * s, 84f, 10f, redHiBrush);
                 }
 
                 // ---------- ADX speedometer (left of the thermometer) ----------
@@ -465,7 +690,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     for (int i = 0; i < ticks.Length; i++)
                     {
                         Vector2 tp = DialPoint(cx, cy, radius + 17f * s, ticks[i] / AdxScaleMax);
-                        DrawCenteredText(ticks[i].ToString("F0"), tp.X, tp.Y - 7f * s, 34f, 10f, dimBrush);
+                        DrawCenteredText(ticks[i].ToString("F0"), tp.X, tp.Y - 7f * s, 38f, 10f, dimBrush);
                     }
 
                     // Customizable ADX threshold markers on the outer arc.
@@ -475,7 +700,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         Vector2 tickB = DialPoint(cx, cy, radius + 9f, AdxLowThreshold / AdxScaleMax);
                         RenderTarget.DrawLine(tickA, tickB, greenHiBrush, Math.Max(1f, 2f * s));
                         Vector2 mp = DialPoint(cx, cy, radius + 13f, AdxLowThreshold / AdxScaleMax);
-                        DrawCenteredText(AdxLowThreshold.ToString("F0"), mp.X, mp.Y - 7f * s, 30f, 9f, greenHiBrush);
+                        DrawCenteredText(AdxLowThreshold.ToString("F0"), mp.X, mp.Y - 7f * s, 34f, 9f, greenHiBrush);
                     }
 
                     if (AdxHighThreshold > 0 && AdxHighThreshold <= AdxScaleMax)
@@ -484,7 +709,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         Vector2 tickB = DialPoint(cx, cy, radius + 9f, AdxHighThreshold / AdxScaleMax);
                         RenderTarget.DrawLine(tickA, tickB, redHiBrush, Math.Max(1f, 2f * s));
                         Vector2 mp = DialPoint(cx, cy, radius + 13f, AdxHighThreshold / AdxScaleMax);
-                        DrawCenteredText(AdxHighThreshold.ToString("F0"), mp.X, mp.Y - 7f * s, 30f, 9f, redHiBrush);
+                        DrawCenteredText(AdxHighThreshold.ToString("F0"), mp.X, mp.Y - 7f * s, 34f, 9f, redHiBrush);
                     }
 
                     // Needle, hub, and value use a brighter shade than the zone arc so they stand out.
@@ -506,15 +731,63 @@ namespace NinjaTrader.NinjaScript.Indicators
                     else if (adxValue < 50.0) regime = "STRONG TREND";
                     else regime = "EXTREME TREND";
 
+                    SolidColorBrush regimeBrush = textBrush;
+                    if (ShowAdxDirection && hasDm && adxValue >= 20.0)
+                    {
+                        if (diPlusValue > diMinusValue)
+                        {
+                            regime = "^ " + regime;
+                            regimeBrush = greenHiBrush;
+                        }
+                        else if (diMinusValue > diPlusValue)
+                        {
+                            regime = "v " + regime;
+                            regimeBrush = redHiBrush;
+                        }
+                    }
+
                     DrawCenteredText("ADX", cx, cy - 44f * s, 90f, 11f, dimBrush);
                     DrawCenteredText(adxValue.ToString("F0"), cx, cy - 30f * s, 90f, 20f, adxNeedleBrush);
-                    DrawCenteredText(regime, cx, cy + 8f * s, 150f, 11f, textBrush);
+                    DrawCenteredText(regime, cx, cy + 8f * s, 185f, 11f, regimeBrush);
                 }
 
-                // ---------- RSI slider (under the speedometer) ----------
-                float rsiW = radius * 2f;
-                float rsiX = cx - radius;
-                float rsiY = cy + 48f * s;
+                float leftColW = radius * 2f;
+                float leftColX = cx - radius;
+                float nextY = cy + 32f * s;
+
+                // ---------- Optional Module 2: +DI / -DI Tug-of-War Bar ----------
+                if (ShowDiBar)
+                {
+                    float diBarH = Math.Max(4f, 6f * s);
+                    if (hasDm)
+                    {
+                        double sumDi = diPlusValue + diMinusValue;
+                        float plusFrac = sumDi > 0.0001 ? (float)(diPlusValue / sumDi) : 0.5f;
+                        float plusW = leftColW * plusFrac;
+
+                        RenderTarget.FillRectangle(new RectangleF(leftColX, nextY, plusW, diBarH), greenZoneBrush);
+                        RenderTarget.FillRectangle(new RectangleF(leftColX + plusW, nextY, leftColW - plusW, diBarH), redZoneBrush);
+                        RenderTarget.DrawRectangle(new RectangleF(leftColX, nextY, leftColW, diBarH), rimBrush, 0.8f);
+
+                        // Center 50/50 divider tick
+                        float midDiX = leftColX + leftColW / 2f;
+                        RenderTarget.DrawLine(new Vector2(midDiX, nextY - 2f), new Vector2(midDiX, nextY + diBarH + 2f), lineWhiteBrush, 1f);
+
+                        SolidColorBrush diTextBrush = diPlusValue >= diMinusValue ? greenHiBrush : redHiBrush;
+                        string diLabel = "+DI " + diPlusValue.ToString("F0") + "  |  -DI " + diMinusValue.ToString("F0");
+                        DrawCenteredText(diLabel, cx, nextY + diBarH + 2f * s, 175f, 9.5f, diTextBrush);
+                    }
+                    nextY += diExtraH + 6f * s;
+                }
+                else
+                {
+                    nextY = cy + 48f * s;
+                }
+
+                // ---------- RSI slider ----------
+                float rsiW = leftColW;
+                float rsiX = leftColX;
+                float rsiY = nextY;
                 float rsiH = Math.Max(6f, 13f * s);
 
                 if (hasRsi)
@@ -553,10 +826,20 @@ namespace NinjaTrader.NinjaScript.Indicators
                     float mx = rsiX + (float)(rsiW * rv / 100.0);
                     RenderTarget.DrawLine(new Vector2(mx, rsiY - 4f * s), new Vector2(mx, rsiY + rsiH + 4f * s), rsiMarkerBrush, Math.Max(1.2f, 3f * s));
 
-                    DrawCenteredText("RSI " + rsiValue.ToString("F0") + " - " + rsiLabel, cx, rsiY + rsiH + 6f * s, 170f, 11f, rsiMarkerBrush);
-                    DrawCenteredText("0", rsiX + 6f, rsiY + rsiH + 20f * s, 24f, 9f, dimBrush);
-                    DrawCenteredText("50", midX, rsiY + rsiH + 20f * s, 24f, 9f, dimBrush);
-                    DrawCenteredText("100", rsiX + rsiW - 10f, rsiY + rsiH + 20f * s, 30f, 9f, dimBrush);
+                    DrawCenteredText("RSI " + rsiValue.ToString("F0") + " - " + rsiLabel, cx, rsiY + rsiH + 6f * s, 210f, 11f, rsiMarkerBrush);
+                    DrawCenteredText("0", rsiX + 6f * s, rsiY + rsiH + 20f * s, 32f, 9f, dimBrush);
+                    DrawCenteredText("50", midX, rsiY + rsiH + 20f * s, 32f, 9f, dimBrush);
+                    DrawCenteredText("100", rsiX + rsiW - 10f * s, rsiY + rsiH + 20f * s, 42f, 9f, dimBrush);
+                }
+
+                // ---------- Optional Module 3: EMA Trend Bias Pill ----------
+                if (ShowEmaBias && hasEma)
+                {
+                    float emaY = rsiY + rsiH + 36f * s;
+                    bool isBull = lastClose >= emaValue;
+                    string emaText = "EMA(" + EmaPeriod + "): " + (isBull ? "^ BULL" : "v BEAR");
+                    SolidColorBrush emaBrush = isBull ? greenHiBrush : redHiBrush;
+                    DrawCenteredText(emaText, cx, emaY, 175f, 10.5f, emaBrush);
                 }
             }
         }
@@ -565,7 +848,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         [NinjaScriptProperty]
         [Range(2, 100)]
-        [Display(Name = "ADX Period", Description = "Lookback period for ADX.", Order = 1, GroupName = "Parameters")]
+        [Display(Name = "ADX Period", Description = "Lookback period for ADX and +DI/-DI.", Order = 1, GroupName = "Parameters")]
         public int AdxPeriod { get; set; }
 
         [NinjaScriptProperty]
@@ -603,6 +886,56 @@ namespace NinjaTrader.NinjaScript.Indicators
         [Display(Name = "ATR Ceiling (Ticks)", Description = "Maximum volatility threshold in ticks (0 to hide).", Order = 8, GroupName = "Parameters")]
         public double AtrCeilingTicks { get; set; }
 
+        [NinjaScriptProperty]
+        [Range(2, 500)]
+        [Display(Name = "EMA Period", Description = "EMA lookback period used when Show EMA Bias is enabled.", Order = 9, GroupName = "Parameters")]
+        public int EmaPeriod { get; set; }
+
+        // ---- Direction Toggles ----------------------------------------------
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show ADX Direction", Description = "Prefix ADX regime label with ^ / v and green/red tint based on +DI vs -DI.", Order = 1, GroupName = "Direction")]
+        public bool ShowAdxDirection { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show DI Tug-of-War", Description = "Display a +DI vs -DI dominance split bar and readout beneath the ADX dial.", Order = 2, GroupName = "Direction")]
+        public bool ShowDiBar { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show EMA Bias", Description = "Display a BULL / BEAR readout comparing Close against the configured EMA.", Order = 3, GroupName = "Direction")]
+        public bool ShowEmaBias { get; set; }
+
+        // ---- Alert Settings -------------------------------------------------
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Alerts", Description = "Master toggle for threshold alerts and the interactive bell icon on the card.", Order = 1, GroupName = "Alerts")]
+        public bool EnableAlerts { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Alert on ADX Momentum", Description = "Alert when ADX crosses above the ADX Low Marker threshold.", Order = 2, GroupName = "Alerts")]
+        public bool AlertOnAdxMomentum { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Alert on DI Crossover", Description = "Alert when +DI and -DI flip dominance while ADX >= 20.", Order = 3, GroupName = "Alerts")]
+        public bool AlertOnDiCross { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Alert on ATR Lock Change", Description = "Alert when ATR enters or exits LOCKED LOW / LOCKED HIGH states.", Order = 4, GroupName = "Alerts")]
+        public bool AlertOnAtrLock { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Alert on RSI Extreme", Description = "Alert when RSI crosses into OVERSOLD (< 30) or OVERBOUGHT (> 70).", Order = 5, GroupName = "Alerts")]
+        public bool AlertOnRsiExtreme { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(5, 3600)]
+        [Display(Name = "Alert Cooldown (sec)", Description = "Minimum seconds between consecutive audio/log alerts.", Order = 6, GroupName = "Alerts")]
+        public int AlertCooldownSeconds { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Alert Sound File", Description = "WAV filename in NinjaTrader 8\\sounds\\ (e.g., Alert1.wav, Alert2.wav).", Order = 7, GroupName = "Alerts")]
+        public string AlertSoundFile { get; set; }
+
         // ---- Layout & Appearance --------------------------------------------
 
         [NinjaScriptProperty]
@@ -638,18 +971,18 @@ namespace NinjaTrader.NinjaScript.Indicators
     public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
     {
         private GaugeCluster[] cacheGaugeCluster;
-        public GaugeCluster GaugeCluster(int adxPeriod, double adxLowThreshold, double adxHighThreshold, int rsiPeriod, int rsiSmooth, int atrPeriod, double atrFloorTicks, double atrCeilingTicks, GaugeClusterPosition position, int offsetX, int offsetY, int sizePercent, int backgroundOpacity)
+        public GaugeCluster GaugeCluster(int adxPeriod, double adxLowThreshold, double adxHighThreshold, int rsiPeriod, int rsiSmooth, int atrPeriod, double atrFloorTicks, double atrCeilingTicks, int emaPeriod, bool showAdxDirection, bool showDiBar, bool showEmaBias, bool enableAlerts, bool alertOnAdxMomentum, bool alertOnDiCross, bool alertOnAtrLock, bool alertOnRsiExtreme, int alertCooldownSeconds, string alertSoundFile, GaugeClusterPosition position, int offsetX, int offsetY, int sizePercent, int backgroundOpacity)
         {
-            return GaugeCluster(Input, adxPeriod, adxLowThreshold, adxHighThreshold, rsiPeriod, rsiSmooth, atrPeriod, atrFloorTicks, atrCeilingTicks, position, offsetX, offsetY, sizePercent, backgroundOpacity);
+            return GaugeCluster(Input, adxPeriod, adxLowThreshold, adxHighThreshold, rsiPeriod, rsiSmooth, atrPeriod, atrFloorTicks, atrCeilingTicks, emaPeriod, showAdxDirection, showDiBar, showEmaBias, enableAlerts, alertOnAdxMomentum, alertOnDiCross, alertOnAtrLock, alertOnRsiExtreme, alertCooldownSeconds, alertSoundFile, position, offsetX, offsetY, sizePercent, backgroundOpacity);
         }
 
-        public GaugeCluster GaugeCluster(ISeries<double> input, int adxPeriod, double adxLowThreshold, double adxHighThreshold, int rsiPeriod, int rsiSmooth, int atrPeriod, double atrFloorTicks, double atrCeilingTicks, GaugeClusterPosition position, int offsetX, int offsetY, int sizePercent, int backgroundOpacity)
+        public GaugeCluster GaugeCluster(ISeries<double> input, int adxPeriod, double adxLowThreshold, double adxHighThreshold, int rsiPeriod, int rsiSmooth, int atrPeriod, double atrFloorTicks, double atrCeilingTicks, int emaPeriod, bool showAdxDirection, bool showDiBar, bool showEmaBias, bool enableAlerts, bool alertOnAdxMomentum, bool alertOnDiCross, bool alertOnAtrLock, bool alertOnRsiExtreme, int alertCooldownSeconds, string alertSoundFile, GaugeClusterPosition position, int offsetX, int offsetY, int sizePercent, int backgroundOpacity)
         {
             if (cacheGaugeCluster != null)
                 for (int idx = 0; idx < cacheGaugeCluster.Length; idx++)
-                    if (cacheGaugeCluster[idx] != null && cacheGaugeCluster[idx].AdxPeriod == adxPeriod && cacheGaugeCluster[idx].AdxLowThreshold == adxLowThreshold && cacheGaugeCluster[idx].AdxHighThreshold == adxHighThreshold && cacheGaugeCluster[idx].RsiPeriod == rsiPeriod && cacheGaugeCluster[idx].RsiSmooth == rsiSmooth && cacheGaugeCluster[idx].AtrPeriod == atrPeriod && cacheGaugeCluster[idx].AtrFloorTicks == atrFloorTicks && cacheGaugeCluster[idx].AtrCeilingTicks == atrCeilingTicks && cacheGaugeCluster[idx].Position == position && cacheGaugeCluster[idx].OffsetX == offsetX && cacheGaugeCluster[idx].OffsetY == offsetY && cacheGaugeCluster[idx].SizePercent == sizePercent && cacheGaugeCluster[idx].BackgroundOpacity == backgroundOpacity && cacheGaugeCluster[idx].EqualsInput(input))
+                    if (cacheGaugeCluster[idx] != null && cacheGaugeCluster[idx].AdxPeriod == adxPeriod && cacheGaugeCluster[idx].AdxLowThreshold == adxLowThreshold && cacheGaugeCluster[idx].AdxHighThreshold == adxHighThreshold && cacheGaugeCluster[idx].RsiPeriod == rsiPeriod && cacheGaugeCluster[idx].RsiSmooth == rsiSmooth && cacheGaugeCluster[idx].AtrPeriod == atrPeriod && cacheGaugeCluster[idx].AtrFloorTicks == atrFloorTicks && cacheGaugeCluster[idx].AtrCeilingTicks == atrCeilingTicks && cacheGaugeCluster[idx].EmaPeriod == emaPeriod && cacheGaugeCluster[idx].ShowAdxDirection == showAdxDirection && cacheGaugeCluster[idx].ShowDiBar == showDiBar && cacheGaugeCluster[idx].ShowEmaBias == showEmaBias && cacheGaugeCluster[idx].EnableAlerts == enableAlerts && cacheGaugeCluster[idx].AlertOnAdxMomentum == alertOnAdxMomentum && cacheGaugeCluster[idx].AlertOnDiCross == alertOnDiCross && cacheGaugeCluster[idx].AlertOnAtrLock == alertOnAtrLock && cacheGaugeCluster[idx].AlertOnRsiExtreme == alertOnRsiExtreme && cacheGaugeCluster[idx].AlertCooldownSeconds == alertCooldownSeconds && cacheGaugeCluster[idx].AlertSoundFile == alertSoundFile && cacheGaugeCluster[idx].Position == position && cacheGaugeCluster[idx].OffsetX == offsetX && cacheGaugeCluster[idx].OffsetY == offsetY && cacheGaugeCluster[idx].SizePercent == sizePercent && cacheGaugeCluster[idx].BackgroundOpacity == backgroundOpacity && cacheGaugeCluster[idx].EqualsInput(input))
                         return cacheGaugeCluster[idx];
-            return CacheIndicator<GaugeCluster>(new GaugeCluster(){ AdxPeriod = adxPeriod, AdxLowThreshold = adxLowThreshold, AdxHighThreshold = adxHighThreshold, RsiPeriod = rsiPeriod, RsiSmooth = rsiSmooth, AtrPeriod = atrPeriod, AtrFloorTicks = atrFloorTicks, AtrCeilingTicks = atrCeilingTicks, Position = position, OffsetX = offsetX, OffsetY = offsetY, SizePercent = sizePercent, BackgroundOpacity = backgroundOpacity }, input, ref cacheGaugeCluster);
+            return CacheIndicator<GaugeCluster>(new GaugeCluster(){ AdxPeriod = adxPeriod, AdxLowThreshold = adxLowThreshold, AdxHighThreshold = adxHighThreshold, RsiPeriod = rsiPeriod, RsiSmooth = rsiSmooth, AtrPeriod = atrPeriod, AtrFloorTicks = atrFloorTicks, AtrCeilingTicks = atrCeilingTicks, EmaPeriod = emaPeriod, ShowAdxDirection = showAdxDirection, ShowDiBar = showDiBar, ShowEmaBias = showEmaBias, EnableAlerts = enableAlerts, AlertOnAdxMomentum = alertOnAdxMomentum, AlertOnDiCross = alertOnDiCross, AlertOnAtrLock = alertOnAtrLock, AlertOnRsiExtreme = alertOnRsiExtreme, AlertCooldownSeconds = alertCooldownSeconds, AlertSoundFile = alertSoundFile, Position = position, OffsetX = offsetX, OffsetY = offsetY, SizePercent = sizePercent, BackgroundOpacity = backgroundOpacity }, input, ref cacheGaugeCluster);
         }
     }
 }
@@ -658,14 +991,14 @@ namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
 {
     public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
     {
-        public Indicators.GaugeCluster GaugeCluster(int adxPeriod, double adxLowThreshold, double adxHighThreshold, int rsiPeriod, int rsiSmooth, int atrPeriod, double atrFloorTicks, double atrCeilingTicks, GaugeClusterPosition position, int offsetX, int offsetY, int sizePercent, int backgroundOpacity)
+        public Indicators.GaugeCluster GaugeCluster(int adxPeriod, double adxLowThreshold, double adxHighThreshold, int rsiPeriod, int rsiSmooth, int atrPeriod, double atrFloorTicks, double atrCeilingTicks, int emaPeriod, bool showAdxDirection, bool showDiBar, bool showEmaBias, bool enableAlerts, bool alertOnAdxMomentum, bool alertOnDiCross, bool alertOnAtrLock, bool alertOnRsiExtreme, int alertCooldownSeconds, string alertSoundFile, GaugeClusterPosition position, int offsetX, int offsetY, int sizePercent, int backgroundOpacity)
         {
-            return indicator.GaugeCluster(Input, adxPeriod, adxLowThreshold, adxHighThreshold, rsiPeriod, rsiSmooth, atrPeriod, atrFloorTicks, atrCeilingTicks, position, offsetX, offsetY, sizePercent, backgroundOpacity);
+            return indicator.GaugeCluster(Input, adxPeriod, adxLowThreshold, adxHighThreshold, rsiPeriod, rsiSmooth, atrPeriod, atrFloorTicks, atrCeilingTicks, emaPeriod, showAdxDirection, showDiBar, showEmaBias, enableAlerts, alertOnAdxMomentum, alertOnDiCross, alertOnAtrLock, alertOnRsiExtreme, alertCooldownSeconds, alertSoundFile, position, offsetX, offsetY, sizePercent, backgroundOpacity);
         }
 
-        public Indicators.GaugeCluster GaugeCluster(ISeries<double> input , int adxPeriod, double adxLowThreshold, double adxHighThreshold, int rsiPeriod, int rsiSmooth, int atrPeriod, double atrFloorTicks, double atrCeilingTicks, GaugeClusterPosition position, int offsetX, int offsetY, int sizePercent, int backgroundOpacity)
+        public Indicators.GaugeCluster GaugeCluster(ISeries<double> input , int adxPeriod, double adxLowThreshold, double adxHighThreshold, int rsiPeriod, int rsiSmooth, int atrPeriod, double atrFloorTicks, double atrCeilingTicks, int emaPeriod, bool showAdxDirection, bool showDiBar, bool showEmaBias, bool enableAlerts, bool alertOnAdxMomentum, bool alertOnDiCross, bool alertOnAtrLock, bool alertOnRsiExtreme, int alertCooldownSeconds, string alertSoundFile, GaugeClusterPosition position, int offsetX, int offsetY, int sizePercent, int backgroundOpacity)
         {
-            return indicator.GaugeCluster(input, adxPeriod, adxLowThreshold, adxHighThreshold, rsiPeriod, rsiSmooth, atrPeriod, atrFloorTicks, atrCeilingTicks, position, offsetX, offsetY, sizePercent, backgroundOpacity);
+            return indicator.GaugeCluster(input, adxPeriod, adxLowThreshold, adxHighThreshold, rsiPeriod, rsiSmooth, atrPeriod, atrFloorTicks, atrCeilingTicks, emaPeriod, showAdxDirection, showDiBar, showEmaBias, enableAlerts, alertOnAdxMomentum, alertOnDiCross, alertOnAtrLock, alertOnRsiExtreme, alertCooldownSeconds, alertSoundFile, position, offsetX, offsetY, sizePercent, backgroundOpacity);
         }
     }
 }
@@ -674,14 +1007,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 {
     public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
     {
-        public Indicators.GaugeCluster GaugeCluster(int adxPeriod, double adxLowThreshold, double adxHighThreshold, int rsiPeriod, int rsiSmooth, int atrPeriod, double atrFloorTicks, double atrCeilingTicks, GaugeClusterPosition position, int offsetX, int offsetY, int sizePercent, int backgroundOpacity)
+        public Indicators.GaugeCluster GaugeCluster(int adxPeriod, double adxLowThreshold, double adxHighThreshold, int rsiPeriod, int rsiSmooth, int atrPeriod, double atrFloorTicks, double atrCeilingTicks, int emaPeriod, bool showAdxDirection, bool showDiBar, bool showEmaBias, bool enableAlerts, bool alertOnAdxMomentum, bool alertOnDiCross, bool alertOnAtrLock, bool alertOnRsiExtreme, int alertCooldownSeconds, string alertSoundFile, GaugeClusterPosition position, int offsetX, int offsetY, int sizePercent, int backgroundOpacity)
         {
-            return indicator.GaugeCluster(Input, adxPeriod, adxLowThreshold, adxHighThreshold, rsiPeriod, rsiSmooth, atrPeriod, atrFloorTicks, atrCeilingTicks, position, offsetX, offsetY, sizePercent, backgroundOpacity);
+            return indicator.GaugeCluster(Input, adxPeriod, adxLowThreshold, adxHighThreshold, rsiPeriod, rsiSmooth, atrPeriod, atrFloorTicks, atrCeilingTicks, emaPeriod, showAdxDirection, showDiBar, showEmaBias, enableAlerts, alertOnAdxMomentum, alertOnDiCross, alertOnAtrLock, alertOnRsiExtreme, alertCooldownSeconds, alertSoundFile, position, offsetX, offsetY, sizePercent, backgroundOpacity);
         }
 
-        public Indicators.GaugeCluster GaugeCluster(ISeries<double> input , int adxPeriod, double adxLowThreshold, double adxHighThreshold, int rsiPeriod, int rsiSmooth, int atrPeriod, double atrFloorTicks, double atrCeilingTicks, GaugeClusterPosition position, int offsetX, int offsetY, int sizePercent, int backgroundOpacity)
+        public Indicators.GaugeCluster GaugeCluster(ISeries<double> input , int adxPeriod, double adxLowThreshold, double adxHighThreshold, int rsiPeriod, int rsiSmooth, int atrPeriod, double atrFloorTicks, double atrCeilingTicks, int emaPeriod, bool showAdxDirection, bool showDiBar, bool showEmaBias, bool enableAlerts, bool alertOnAdxMomentum, bool alertOnDiCross, bool alertOnAtrLock, bool alertOnRsiExtreme, int alertCooldownSeconds, string alertSoundFile, GaugeClusterPosition position, int offsetX, int offsetY, int sizePercent, int backgroundOpacity)
         {
-            return indicator.GaugeCluster(input, adxPeriod, adxLowThreshold, adxHighThreshold, rsiPeriod, rsiSmooth, atrPeriod, atrFloorTicks, atrCeilingTicks, position, offsetX, offsetY, sizePercent, backgroundOpacity);
+            return indicator.GaugeCluster(input, adxPeriod, adxLowThreshold, adxHighThreshold, rsiPeriod, rsiSmooth, atrPeriod, atrFloorTicks, atrCeilingTicks, emaPeriod, showAdxDirection, showDiBar, showEmaBias, enableAlerts, alertOnAdxMomentum, alertOnDiCross, alertOnAtrLock, alertOnRsiExtreme, alertCooldownSeconds, alertSoundFile, position, offsetX, offsetY, sizePercent, backgroundOpacity);
         }
     }
 }
