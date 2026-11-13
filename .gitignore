@@ -1,0 +1,10 @@
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+bin/
+obj/
+.vs/
+.vscode/
+Thumbs.db
+.DS_Store
