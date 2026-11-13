@@ -17,12 +17,13 @@ A compact, display-only HUD instrument cluster for the NinjaTrader 8 price panel
 * **ATR Tick Thermometer (`0–60t`):**
   * Vertical volatility column measured directly in instrument ticks (`ATR / TickSize`).
   * Customizable **Floor** (default `5t`) and **Ceiling** (default `44t`) threshold lines with `LOCKED LOW` and `LOCKED HIGH` warnings when volatility sits outside your tradable window.
-* **Threshold Audio/Log Alerts (`Enable Alerts`, default OFF):**
+* **Threshold Audio & Log Alerts (`Enable Alerts`, default OFF):**
   * Rising-edge alerts for **ADX Momentum** (`ADX >= ADX Low Marker`), **`+DI / -DI` Crossovers** (when `ADX >= 20`), **ATR Lock State Changes** (`LOCKED LOW`, `LOCKED HIGH`, or `UNLOCKED`), and **RSI Extremes** (`< 30` or `> 70`).
   * Draws a clickable **Bell Icon** in the top-left corner of the card when enabled so you can mute or unmute audio alerts on the fly without opening indicator properties.
 
 ## Key Features
 
+* **Interactive Audio & Log Alerts:** Optional rising-edge alerts with customizable WAV sound, cooldown timer, visual flash, and a clickable mute/unmute bell icon directly on the card.
 * **Drag-and-Drop Positioning:** Click and drag anywhere on the rounded card to reposition it across the price panel. `Offset X` and `Offset Y` update automatically relative to your chosen anchor (`TopLeft`, `TopRight`, `MiddleLeft`, `MiddleRight`, `BottomLeft`, `BottomRight`).
 * **Auto-Scaling + Manual Zoom:** Scales proportionally with your chart panel size (`0.40x–1.25x`) plus a manual **Size %** multiplier from `40%` to `300%`, with `NoWrap` DirectWrite text layouts so labels never split across lines at small scales.
 * **Adjustable Opaque Card:** Rounded-corner dark background card with configurable **Background Opacity %** (`0%` transparent to `100%` solid) that dynamically resizes to fit active optional rows.
