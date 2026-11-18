@@ -1,5 +1,5 @@
 // ============================================================================
-// GaugeCluster.cs v1.9 - An all-in-one HUD instrument cluster for NinjaTrader 8:
+// GaugeCluster.cs v1.10 - An all-in-one HUD instrument cluster for NinjaTrader 8:
 //   * ADX(14)  - Semicircular speedometer (0-80 scale; zones 0-20 grey,
 //     20-25 amber, 25-50 green, 50-80 red) with two customizable radial
 //     threshold ticks (default 28 and 32), dynamic regime labels with
@@ -16,17 +16,18 @@
 //     customizable floor and ceiling threshold lines (default 5t and 44t),
 //     zone-matched mercury and high-contrast tick readout, and LOCKED LOW /
 //     LOCKED HIGH status alerts.
-//   * Optional Audio/Visual Alerts (v1.9, default OFF) - Threshold crossing
-//     alerts for ADX Momentum entry, +DI/-DI directional flips, ATR Lock
-//     state changes, and RSI extremes with a clickable mute/unmute bell icon.
+//   * Optional Audio/Visual Alerts (default OFF) - Threshold crossing alerts
+//     for ADX Momentum entry, +DI/-DI directional flips, ATR Lock state
+//     changes, and RSI extremes with a clickable mute/unmute bell icon.
 //
 // Features:
 //   * Auto-scales proportionally to chart panel size (clamped 0.40x-1.25x)
 //     plus a manual Size % multiplier (40% - 300%).
 //   * Rounded-corner opaque background card with adjustable opacity (0-100%)
 //     that dynamically adjusts height based on active optional modules.
-//   * Drag-and-drop repositioning anywhere on the price panel; Offset X/Y
-//     update automatically relative to the selected corner/edge anchor.
+//   * Full-panel drag-and-drop repositioning anywhere inside the price panel
+//     (including above MiddleLeft/MiddleRight centerline) with automatic
+//     edge clamping so the card never slides off the top or bottom edge.
 //   * Cached DirectWrite factory and TextFormats for zero-allocation text
 //     rendering on chart refreshes.
 //
@@ -107,8 +108,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         private RectangleF bellBounds = RectangleF.Empty;
         private bool isDragging;
         private System.Windows.Point dragStartMouse;
-        private int dragStartOffsetX;
-        private int dragStartOffsetY;
+        private float dragStartLeft;
+        private float dragStartTop;
         private bool mouseHooked;
 
         protected override void OnStateChange()
@@ -238,8 +239,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 isDragging = true;
                 dragStartMouse = pt;
-                dragStartOffsetX = OffsetX;
-                dragStartOffsetY = OffsetY;
+                dragStartLeft = clusterBounds.X;
+                dragStartTop = clusterBounds.Y;
                 ChartControl.CaptureMouse();
                 e.Handled = true;
             }
@@ -247,25 +248,56 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private void OnChartMouseMove(object sender, MouseEventArgs e)
         {
-            if (!isDragging || ChartControl == null)
+            if (!isDragging || ChartControl == null || ChartPanel == null || clusterBounds.IsEmpty)
                 return;
 
             System.Windows.Point pt = e.GetPosition(ChartControl);
-            int dx = (int)Math.Round(pt.X - dragStartMouse.X);
-            int dy = (int)Math.Round(pt.Y - dragStartMouse.Y);
+            float dx = (float)(pt.X - dragStartMouse.X);
+            float dy = (float)(pt.Y - dragStartMouse.Y);
 
-            bool rightAnchored = (Position == GaugeClusterPosition.TopRight
-                               || Position == GaugeClusterPosition.MiddleRight
-                               || Position == GaugeClusterPosition.BottomRight);
+            float clusterW = clusterBounds.Width;
+            float clusterH = clusterBounds.Height;
 
-            bool bottomAnchored = (Position == GaugeClusterPosition.BottomLeft
-                                || Position == GaugeClusterPosition.BottomRight);
+            float minX = ChartPanel.X;
+            float maxX = Math.Max(minX, ChartPanel.X + ChartPanel.W - clusterW);
+            float minY = ChartPanel.Y;
+            float maxY = Math.Max(minY, ChartPanel.Y + ChartPanel.H - clusterH);
 
-            int newOffsetX = rightAnchored ? (dragStartOffsetX - dx) : (dragStartOffsetX + dx);
-            int newOffsetY = bottomAnchored ? (dragStartOffsetY - dy) : (dragStartOffsetY + dy);
+            float clampedX = Math.Max(minX, Math.Min(maxX, dragStartLeft + dx));
+            float clampedY = Math.Max(minY, Math.Min(maxY, dragStartTop + dy));
 
-            OffsetX = Math.Max(0, Math.Min(3000, newOffsetX));
-            OffsetY = Math.Max(0, Math.Min(3000, newOffsetY));
+            int newOffsetX;
+            int newOffsetY;
+            switch (Position)
+            {
+                case GaugeClusterPosition.TopRight:
+                    newOffsetX = (int)Math.Round(ChartPanel.X + ChartPanel.W - clusterW - clampedX);
+                    newOffsetY = (int)Math.Round(clampedY - ChartPanel.Y);
+                    break;
+                case GaugeClusterPosition.MiddleLeft:
+                    newOffsetX = (int)Math.Round(clampedX - ChartPanel.X);
+                    newOffsetY = (int)Math.Round(clampedY - (ChartPanel.Y + (ChartPanel.H - clusterH) / 2f));
+                    break;
+                case GaugeClusterPosition.MiddleRight:
+                    newOffsetX = (int)Math.Round(ChartPanel.X + ChartPanel.W - clusterW - clampedX);
+                    newOffsetY = (int)Math.Round(clampedY - (ChartPanel.Y + (ChartPanel.H - clusterH) / 2f));
+                    break;
+                case GaugeClusterPosition.BottomLeft:
+                    newOffsetX = (int)Math.Round(clampedX - ChartPanel.X);
+                    newOffsetY = (int)Math.Round(ChartPanel.Y + ChartPanel.H - clusterH - clampedY);
+                    break;
+                case GaugeClusterPosition.BottomRight:
+                    newOffsetX = (int)Math.Round(ChartPanel.X + ChartPanel.W - clusterW - clampedX);
+                    newOffsetY = (int)Math.Round(ChartPanel.Y + ChartPanel.H - clusterH - clampedY);
+                    break;
+                default: // TopLeft
+                    newOffsetX = (int)Math.Round(clampedX - ChartPanel.X);
+                    newOffsetY = (int)Math.Round(clampedY - ChartPanel.Y);
+                    break;
+            }
+
+            OffsetX = Math.Max(-3000, Math.Min(3000, newOffsetX));
+            OffsetY = Math.Max(-3000, Math.Min(3000, newOffsetY));
 
             ChartControl.InvalidateVisual();
             e.Handled = true;
@@ -543,6 +575,14 @@ namespace NinjaTrader.NinjaScript.Indicators
                     oy = ChartPanel.Y + OffsetY;
                     break;
             }
+
+            // Keep the card fully inside the price panel bounds.
+            float minX = ChartPanel.X;
+            float maxX = Math.Max(minX, ChartPanel.X + ChartPanel.W - clusterW);
+            float minY = ChartPanel.Y;
+            float maxY = Math.Max(minY, ChartPanel.Y + ChartPanel.H - clusterH);
+            ox = Math.Max(minX, Math.Min(maxX, ox));
+            oy = Math.Max(minY, Math.Min(maxY, oy));
 
             float cornerRadius = 12f * s;
             RectangleF bgRect = new RectangleF(ox, oy, clusterW, clusterH);
@@ -943,12 +983,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         public GaugeClusterPosition Position { get; set; }
 
         [NinjaScriptProperty]
-        [Range(0, 3000)]
+        [Range(-3000, 3000)]
         [Display(Name = "Offset X (px)", Description = "Horizontal offset in pixels from the anchor (updates automatically when dragged).", Order = 2, GroupName = "Layout")]
         public int OffsetX { get; set; }
 
         [NinjaScriptProperty]
-        [Range(0, 3000)]
+        [Range(-3000, 3000)]
         [Display(Name = "Offset Y (px)", Description = "Vertical offset in pixels from the anchor (updates automatically when dragged).", Order = 3, GroupName = "Layout")]
         public int OffsetY { get; set; }
 
